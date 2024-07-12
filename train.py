@@ -7,12 +7,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from transformers import BertConfig, BertModel, AutoTokenizer
 
+
 # Constants
 TEST_SIZE = 0.2
 DROP_OUT_P = 0.1
 CHECKPOINT = "codesage/codesage-small"
 BATCH_SIZE = 16
 NUM_EPOCHS = 200
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
 # Load and preprocess data
 df = pd.read_csv('full_data.csv')
@@ -26,7 +31,7 @@ train_data, valid_data, train_labels, valid_labels = train_test_split(
 tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT, trust_remote_code=True, add_eos_token=True)
 config = BertConfig.from_pretrained(CHECKPOINT)
 config.hidden_size = 128  # New hidden size
-model = BertModel(config)
+model = BertModel(config).to(device)
 
 # Tokenize and encode data
 def tokenize_data(data_list):
@@ -37,8 +42,8 @@ def tokenize_data(data_list):
 train_inputs = tokenize_data(train_data)
 
 # Create dataset and dataloader
-train_labels_tensor = torch.tensor(train_labels)
-train_dataset = TensorDataset(train_inputs['input_ids'], train_inputs['attention_mask'], train_labels_tensor)
+train_labels_tensor = torch.tensor(train_labels).to(device)
+train_dataset = TensorDataset(train_inputs['input_ids'].to(device), train_inputs['attention_mask'].to(device), train_labels_tensor)
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # Improved LSTM Classifier
@@ -50,7 +55,7 @@ class ImprovedLSTMClassifier(nn.Module):
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
         self.sigmoid = nn.Sigmoid()
-
+        
     def attention_net(self, lstm_output, final_state):
         hidden = final_state.view(-1, hidden_dim, 1)
         attn_weights = torch.bmm(lstm_output, hidden).squeeze(2)
@@ -71,7 +76,7 @@ class ImprovedLSTMClassifier(nn.Module):
 embedding_dim = 128
 hidden_dim = 64
 output_dim = 1
-model_LSTM = ImprovedLSTMClassifier(embedding_dim, hidden_dim, output_dim, num_layers=2, dropout=0.3)
+model_LSTM = ImprovedLSTMClassifier(embedding_dim, hidden_dim, output_dim, num_layers=2, dropout=0.3).to(device)
 
 criterion = nn.BCELoss()
 optimizer = optim.Adamax(model_LSTM.parameters(), lr=0.001, weight_decay=1e-5)
@@ -103,8 +108,7 @@ for epoch in range(NUM_EPOCHS):
 
     accuracy = correct_predictions / total_predictions
     print(f'Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {epoch_loss/len(train_loader):.4f}, Accuracy: {accuracy:.4f}')
-
-torch.save(model_LSTM.state_dict(), 'model.pth')
+    torch.save(model_LSTM.state_dict(), 'model.pth')
 
 # Evaluation function
 def evaluate(model_LSTM, model, dataloader):
@@ -140,8 +144,8 @@ def evaluate(model_LSTM, model, dataloader):
 
 # Create validation dataloader
 valid_inputs = tokenize_data(valid_data)
-valid_labels_tensor = torch.tensor(valid_labels)
-valid_dataset = TensorDataset(valid_inputs['input_ids'], valid_inputs['attention_mask'], valid_labels_tensor)
+valid_labels_tensor = torch.tensor(valid_labels).to(device)
+valid_dataset = TensorDataset(valid_inputs['input_ids'].to(device), valid_inputs['attention_mask'].to(device), valid_labels_tensor)
 valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # Evaluate the model

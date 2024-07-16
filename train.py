@@ -13,8 +13,8 @@ print("Training LSTM model...")
 
 TEST_SIZE = 0.2
 DROP_OUT_P = 0.1
-num_epochs = 100
-checkpoint = "codesage/codesage-small"
+num_epochs = 200
+checkpoint = "codesage/codesage-base"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device: ", device)
 
@@ -81,10 +81,10 @@ class ImprovedLSTMClassifier(nn.Module):
         return out.squeeze()
 
 embedding_dim = 1024
-hidden_dim = 64
+hidden_dim = 128
 output_dim = 1
 
-model_LSTM = ImprovedLSTMClassifier(embedding_dim, hidden_dim, output_dim, num_layers=2, dropout=0.3).to(device)
+model_LSTM = ImprovedLSTMClassifier(embedding_dim, hidden_dim, output_dim, num_layers=10, dropout=0.3).to(device)
 
 criterion = nn.BCEWithLogitsLoss()
 
@@ -123,7 +123,7 @@ def evaluate(model, dataloader, criterion):
     return avg_loss, accuracy, precision, recall, f1
 
 # Early stopping criteria
-patience = 10
+patience = 15
 best_val_loss = float('inf')
 patience_counter = 0
 

@@ -4,146 +4,128 @@ import torch
 from sklearn.model_selection import train_test_split
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import os.path
-import pickle
-from torch.nn.utils.rnn import pad_sequence
-from sklearn.metrics import precision_score, recall_score, f1_score
+from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
 import matplotlib.pyplot as plt
+from torch.cuda.amp import autocast, GradScaler
+
+print("Training LSTM model...")
 
 TEST_SIZE = 0.2
 DROP_OUT_P = 0.1
-num_epochs = 200
+num_epochs = 100
 checkpoint = "codesage/codesage-small"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device: ",device)
-
+print("Using device: ", device)
 
 # Load tokenizer and model
 tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True, add_eos_token=True)
 model = AutoModel.from_pretrained(checkpoint, trust_remote_code=True).to(device)
 
-
 # Load and preprocess data
 df = pd.read_csv('full_data.csv')
-train_data = df['code'].values
-train_labels = df['label'].values
+train_data, valid_data, train_labels, valid_labels = train_test_split(df['code'].values, df['label'].values, test_size=TEST_SIZE, random_state=42)
 
-train_data, valid_data, train_labels, valid_labels = train_test_split(train_data, train_labels, test_size=TEST_SIZE, random_state=42)
-label_counts = df.iloc[:, 1].value_counts()
-label_one = label_counts.get(1, 0)
-label_zero = label_counts.get(0, 0)
-gen_one = False
-gen_zero = False
-if label_one < label_zero:
-    if label_one / label_zero < 2/3:
-        gen_one = True
-else:
-   if label_zero / label_one < 2/3:
-        gen_zero = True 
+class CodeDataset(Dataset):
+    def __init__(self, data, labels, tokenizer, base_model):
+        self.data = data
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.base_model = base_model
 
-vocab_size = tokenizer.vocab_size
+    def __len__(self):
+        return len(self.data)
 
-def encode_and_check(text, tokenizer, max_length=1024):
-    inputs = tokenizer.encode(text, return_tensors="pt", truncation=True, max_length=max_length).to(device)
-    if inputs.max() >= vocab_size:
-        raise IndexError("Token ID out of range")
-    return inputs
+    def __getitem__(self, idx):
+        inputs = self.tokenizer(self.data[idx], return_tensors="pt", truncation=True, max_length=1024)
+        with torch.no_grad():
+            embedding = self.base_model(**inputs.to(device)).last_hidden_state[:, 0, :].cpu()
+        return embedding.squeeze(0), self.labels[idx]
 
-embeddings = []
-embedding_gen = []
-label_gen = []
-file_path_embeddings = 'embeddings.pkl'
-file_path_embeddings_gen = 'embedding_gen.pkl'
-file_label_gen = 'label_gen.pkl'
+train_dataset = CodeDataset(train_data, train_labels, tokenizer, model)
+valid_dataset = CodeDataset(valid_data, valid_labels, tokenizer, model)
 
-
-idx_label = 0
-for code_snippet in train_data:
-    inputs = encode_and_check(code_snippet, tokenizer)
-    with torch.no_grad():
-        embedding = model(inputs)[0]
-    embeddings.append(embedding[0])
-    if gen_one and train_labels[idx_label] == 1:
-        prob_tensor = torch.empty_like(embedding[0]).bernoulli_(p = DROP_OUT_P) * (1 / (1 - DROP_OUT_P))
-        embedding_gen.append(embedding[0]*prob_tensor)
-        label_gen.append(1)
-    if gen_zero and train_labels[idx_label] == 0:
-        prob_tensor = torch.empty_like(embedding[0]).bernoulli_(p = DROP_OUT_P) * (1 / (1 - DROP_OUT_P))
-        embedding_gen.append(embedding[0]*prob_tensor)
-        label_gen.append(0) 
-    idx_label += 1
-    print(idx_label)   
-
-# with open(file_path_embeddings, 'wb') as f:
-#     pickle.dump(embeddings, f)
-# with open(file_path_embeddings_gen, 'wb') as f:
-#     pickle.dump(embedding_gen , f)
-# with open(file_label_gen, 'wb') as f:
-#     pickle.dump(label_gen, f)
-
-# Convert embeddings to tensor and pad sequences
-padded_embeddings = pad_sequence(embeddings, batch_first=True).to(device)
-train_labels_tensor = torch.tensor(train_labels).to(device)
-
-# Create TensorDataset and DataLoader
-train_dataset = TensorDataset(padded_embeddings, train_labels_tensor)
-# Move data to GPU if availabl
 train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, pin_memory=True)
-
-
-valid_embeddings = []
-valid_labels_tensor = torch.tensor(valid_labels)
-
-for code_snippet in valid_data:
-    inputs = encode_and_check(code_snippet, tokenizer)
-    with torch.no_grad():
-        embedding = model(inputs)[0]
-    valid_embeddings.append(embedding[0])
-
-padded_valid_embeddings = pad_sequence(valid_embeddings, batch_first=True)
-valid_dataset = TensorDataset(padded_valid_embeddings, valid_labels_tensor)
-valid_loader = DataLoader(valid_dataset, batch_size=8, shuffle=False)
+valid_loader = DataLoader(valid_dataset, batch_size=8, shuffle=False, pin_memory=True)
 
 class ImprovedLSTMClassifier(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim, output_dim, num_layers=1, dropout=0.5):
+    def __init__(self, embedding_dim, hidden_dim, output_dim, num_layers = 10, dropout=0.5):
         super(ImprovedLSTMClassifier, self).__init__()
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout)
         self.batch_norm = nn.BatchNorm1d(hidden_dim)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
-        self.sigmoid = nn.Sigmoid()
+        self.hidden_dim = hidden_dim
 
     def attention_net(self, lstm_output, final_state):
-        hidden = final_state.view(-1, hidden_dim, 1)
+        hidden = final_state.view(-1, self.hidden_dim, 1)
         attn_weights = torch.bmm(lstm_output, hidden).squeeze(2)
         soft_attn_weights = nn.functional.softmax(attn_weights, 1)
-        new_hidden_state = torch.bmm(lstm_output.transpose(1, 2), soft_attn_weights.unsqueeze(2)).squeeze(2)
-        return new_hidden_state
+        context = torch.bmm(lstm_output.transpose(1, 2), soft_attn_weights.unsqueeze(2)).squeeze(2)
+        return context
 
     def forward(self, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        
+        batch_size, seq_len, _ = x.size()
+        
         lstm_out, (hn, cn) = self.lstm(x)
+        
         attn_out = self.attention_net(lstm_out, hn[-1])
-        attn_out = self.batch_norm(attn_out)  # Apply Batch Normalization
+        
+        attn_out = self.batch_norm(attn_out)
+        
         out = self.dropout(attn_out)
         out = self.fc(out)
-        out = self.sigmoid(out)
-        return out
-
+        return out.squeeze()
 
 embedding_dim = 1024
 hidden_dim = 64
-output_dim = 1  
+output_dim = 1
 
-model_LSTM = ImprovedLSTMClassifier(embedding_dim, hidden_dim, output_dim, num_layers=2, dropout=0.3)
-model_LSTM = model_LSTM.to(device)
+model_LSTM = ImprovedLSTMClassifier(embedding_dim, hidden_dim, output_dim, num_layers=2, dropout=0.3).to(device)
 
+criterion = nn.BCEWithLogitsLoss()
 
-criterion = nn.BCELoss()
+# Add L2 regularization
 optimizer = optim.AdamW(model_LSTM.parameters(), lr=0.001, weight_decay=1e-5)
+scaler = GradScaler()
 
 train_losses = []
 val_losses = []
+
+print("Training LSTM model...")
+
+def evaluate(model, dataloader, criterion):
+    model.eval()
+    total_loss = 0.0
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels.float())
+            total_loss += loss.item()
+
+            predictions = (torch.sigmoid(outputs) > 0.5).float()
+            all_predictions.extend(predictions.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    avg_loss = total_loss / len(dataloader)
+    accuracy = (torch.tensor(all_predictions) == torch.tensor(all_labels)).float().mean().item()
+    precision = precision_score(all_labels, all_predictions)
+    recall = recall_score(all_labels, all_predictions)
+    f1 = f1_score(all_labels, all_predictions)
+
+    return avg_loss, accuracy, precision, recall, f1
+
+# Early stopping criteria
+patience = 10
+best_val_loss = float('inf')
+patience_counter = 0
 
 for epoch in range(num_epochs):
     model_LSTM.train()
@@ -154,91 +136,51 @@ for epoch in range(num_epochs):
     for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model_LSTM(inputs)
-        loss = criterion(outputs.squeeze(), labels.float())
-        loss.backward()
-        optimizer.step()
-
-        epoch_loss += loss.item()
-
-        # Calculate accuracy
+        
+        with autocast():
+            outputs = model_LSTM(inputs)
+            loss = criterion(outputs, labels.float())
         predictions = (outputs.squeeze() > 0.5).float()
         correct_predictions += (predictions == labels).sum().item()
         total_predictions += labels.size(0)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
+        epoch_loss += loss.item()
+    train_loss = epoch_loss / len(train_loader)
+    train_losses.append(train_loss)
     accuracy = correct_predictions / total_predictions
-    train_losses.append(epoch_loss / len(train_loader))
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {train_losses[-1]:.4f}, Accuracy: {accuracy:.4f}')
-    model_LSTM.eval()
-    val_loss = 0.0
-    correct_predictions = 0
-    total_predictions = 0
 
-    with torch.no_grad():
-        for inputs, labels in valid_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model_LSTM(inputs)
-            loss = criterion(outputs.squeeze(), labels.float())
-            val_loss += loss.item()
-
-            # Calculate accuracy
-            predictions = (outputs.squeeze() > 0.5).float()
-            correct_predictions += (predictions == labels).sum().item()
-            total_predictions += labels.size(0)
-
-    val_loss /= len(valid_loader)
+    val_loss, val_accuracy, val_precision, val_recall, val_f1 = evaluate(model_LSTM, valid_loader, criterion)
     val_losses.append(val_loss)
-    val_accuracy = correct_predictions / total_predictions
 
-    print(f'Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}')
+    print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Train Accuracy: {accuracy:.4f}, Val Loss: {val_loss:.4f}, '
+          f'Val Accuracy: {val_accuracy:.4f}, Val Precision: {val_precision:.4f}, '
+          f'Val Recall: {val_recall:.4f}, Val F1: {val_f1:.4f}')
 
+    torch.cuda.empty_cache()
 
-torch.save(model_LSTM.state_dict(), 'model.pth')
+    # Early stopping
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        patience_counter = 0
+        torch.save(model_LSTM.state_dict(), 'best_model.pth')  # Save the best model
+    else:
+        patience_counter += 1
 
-# Evaluate model on validation set
+    if patience_counter >= patience:
+        print("Early stopping triggered")
+        break
 
-def evaluate(model, dataloader):
-    model.eval()
-    epoch_loss = 0.0
-    correct_predictions = 0
-    total_predictions = 0
-    all_predictions = []
-    all_labels = []
+# Load the best model
+model_LSTM.load_state_dict(torch.load('best_model.pth'))
 
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs.squeeze(), labels.float())
-            epoch_loss += loss.item()
-
-            # Calculate accuracy
-            predictions = (outputs.squeeze() > 0.5).float()
-            correct_predictions += (predictions == labels).sum().item()
-            total_predictions += labels.size(0)
-
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    accuracy = correct_predictions / total_predictions
-    precision = precision_score(all_labels, all_predictions)
-    recall = recall_score(all_labels, all_predictions)
-    f1 = f1_score(all_labels, all_predictions)
-
-    return accuracy, precision, recall, f1, epoch_loss / len(dataloader)
-
-accuracy, precision, recall, f1, val_loss = evaluate(model_LSTM, valid_loader)
-
-print(f'Validation Loss: {val_loss:.4f}')
-print(f'Validation Accuracy: {accuracy:.4f}')
-print(f'Validation Precision: {precision:.4f}')
-print(f'Validation Recall: {recall:.4f}')
-print(f'Validation F1 Score: {f1:.4f}')
-
-# Plot training loss over epochs
+# Plot training and validation loss
 plt.figure(figsize=(10, 6))
 plt.plot(train_losses, label='Training Loss', color='blue')
-plt.plot(range(num_epochs), val_losses, label='Validation Loss', color='red', linestyle='--')
+plt.plot(val_losses, label='Validation Loss', color='red', linestyle='--')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.title('Training and Validation Loss over Epochs')
@@ -246,3 +188,23 @@ plt.legend()
 plt.grid(True)
 plt.savefig('training_validation_loss.png')
 plt.show()
+
+val_loss, val_accuracy, val_precision, val_recall, val_f1 = evaluate(model_LSTM, valid_loader, criterion)
+
+# Calculate ROC AUC
+model_LSTM.eval()
+all_predictions = []
+all_labels = []
+
+with torch.no_grad():
+    for inputs, labels in valid_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = model_LSTM(inputs)
+        probabilities = torch.sigmoid(outputs)
+        all_predictions.extend(probabilities.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+roc_auc = roc_auc_score(all_labels, all_predictions)
+
+print(f'Final Validation Results - Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}, '
+      f'Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, F1: {val_f1:.4f}, ROC AUC: {roc_auc:.4f}')

@@ -16,7 +16,7 @@ print("Training LSTM model...")
 TEST_SIZE = 0.2
 DROP_OUT_P = 0.1
 num_epochs = 200
-checkpoint = "codesage/codesage-small"
+checkpoint = "codesage/codesage-base"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device: ", device)
 

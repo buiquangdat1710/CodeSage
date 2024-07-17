@@ -25,7 +25,7 @@ config.hidden_size = 512
 model = AutoModel.from_pretrained(checkpoint, config=config, trust_remote_code=True, ignore_mismatched_sizes=True).to(device)
 
 # Load and preprocess data
-df = pd.read_csv('full_data.csv').head(100)
+df = pd.read_csv('full_data.csv')
 train_data, valid_data, train_labels, valid_labels = train_test_split(df['code'].values, df['label'].values, test_size=TEST_SIZE, random_state=42)
 
 class CodeDataset(Dataset):

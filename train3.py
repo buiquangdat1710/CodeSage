@@ -8,7 +8,9 @@ from torch.utils.data import DataLoader, Dataset
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 from torch.cuda.amp import autocast, GradScaler
-
+import numpy as np
+import re
+import tensorflow as tf
 print("Training LSTM model...")
 
 TEST_SIZE = 0.2
@@ -26,6 +28,21 @@ model = AutoModel.from_pretrained(checkpoint, config=config, trust_remote_code=T
 
 # Load and preprocess data
 df = pd.read_csv('full_data.csv')
+df  = df[['code', 'label']]
+comment_regex = r'(//[^\n]*|\/\*[\s\S]*?\*\/)'
+newline_regex = '\n{1,}'
+whitespace_regex = '\s{2,}'
+
+def data_cleaning(inp, pat, rep):
+    return re.sub(pat, rep, inp)
+
+df['truncated_code'] = (df ['code'].apply(data_cleaning, args=(comment_regex, ''))
+                                      .apply(data_cleaning, args=(newline_regex, ' '))
+                                      .apply(data_cleaning, args=(whitespace_regex, ' '))
+                         )
+# remove all data points that have more than 15000 characters
+length_check = np.array([len(x) for x in df['truncated_code']]) > 15000
+df = df[~length_check]
 train_data, valid_data, train_labels, valid_labels = train_test_split(df['code'].values, df['label'].values, test_size=TEST_SIZE, random_state=42)
 
 class CodeDataset(Dataset):
@@ -91,7 +108,12 @@ model_LSTM = ImprovedLSTMClassifier(embedding_dim, hidden_dim, output_dim, num_l
 criterion = nn.BCEWithLogitsLoss()
 
 # Add L2 regularization
-optimizer = optim.AdamW(model_LSTM.parameters(), lr=0.001, weight_decay=1e-5)
+# initial_learning_rate = 0.01
+# decay_steps = 10
+# decay_rate = 0.9
+
+optimizer = torch.optim.AdamW(model_LSTM.parameters(),lr=0.001, weight_decay=1e-5)
+# scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
 scaler = GradScaler()
 
 train_losses = []
@@ -118,9 +140,9 @@ def evaluate(model, dataloader, criterion):
 
     avg_loss = total_loss / len(dataloader)
     accuracy = (torch.tensor(all_predictions) == torch.tensor(all_labels)).float().mean().item()
-    precision = precision_score(all_labels, all_predictions)
-    recall = recall_score(all_labels, all_predictions)
-    f1 = f1_score(all_labels, all_predictions)
+    precision = precision_score(all_labels, all_predictions,zero_division=0)
+    recall = recall_score(all_labels, all_predictions,zero_division=0)
+    f1 = f1_score(all_labels, all_predictions,zero_division=0)
 
     return avg_loss, accuracy, precision, recall, f1
 
@@ -163,6 +185,7 @@ for epoch in range(num_epochs):
           f'Val Recall: {val_recall:.4f}, Val F1: {val_f1:.4f}')
 
     torch.cuda.empty_cache()
+    # scheduler.step()
 
     # Early stopping
     # if val_loss < best_val_loss:
